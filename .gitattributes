@@ -1,0 +1,5 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Replace FPWeapon with the actual folder(s) where we want large assets tracked.
+Content/FPWeapon/** filter=lfs diff=lfs merge=lfs -text
