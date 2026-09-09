@@ -1,0 +1,83 @@
+#!/bin/bash
+# Guards against pushing raw binaries / engine-generated junk to GitHub.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+# Bypass (rarely right):  git commit --no-verify
+#
+# Checks every staged file for three failure modes:
+#   1. Engine-generated paths that should be gitignored (Saved/, Intermediate/, ...)
+#   2. Binaries matched by .gitattributes but staged as raw blobs (LFS not applied)
+#   3. Untracked-by-LFS files over 5 MiB (a binary type missing from .gitattributes)
+
+set -u
+
+MAX_RAW_BYTES=5242880 # 5 MiB
+LFS_MAGIC='version https://git-lfs.github.com/spec/v1'
+
+ignore_violations=()
+lfs_violations=()
+size_violations=()
+
+while IFS= read -r -d '' file; do
+    # --- 1. engine-generated junk -------------------------------------------
+    case "$file" in
+        */Saved/*|Saved/*|\
+        */Intermediate/*|Intermediate/*|\
+        */DerivedDataCache/*|DerivedDataCache/*|\
+        */Binaries/*|Binaries/*|\
+        */Build/*|Build/*|\
+        *_BuiltData.uasset|\
+        *.sln|*.suo|*.VC.db|*/.vs/*)
+            ignore_violations+=("$file")
+            continue
+            ;;
+    esac
+
+    size=$(git cat-file -s ":$file" 2>/dev/null) || continue
+    header=$(git cat-file -p ":$file" 2>/dev/null | head -c ${#LFS_MAGIC})
+    is_pointer=0
+    [ "$header" = "$LFS_MAGIC" ] && is_pointer=1
+
+    # --- 2. .gitattributes says LFS, but the staged blob is raw --------------
+    expects_lfs=$(git check-attr filter -- "$file" | sed 's/.*: //')
+    if [ "$expects_lfs" = "lfs" ] && [ "$is_pointer" -eq 0 ]; then
+        lfs_violations+=("$file")
+        continue
+    fi
+
+    # --- 3. large file with no LFS rule at all -------------------------------
+    if [ "$is_pointer" -eq 0 ] && [ "$size" -gt "$MAX_RAW_BYTES" ]; then
+        size_violations+=("$file ($((size / 1048576)) MiB)")
+    fi
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+status=0
+
+if [ ${#ignore_violations[@]} -gt 0 ]; then
+    echo "pre-commit: engine-generated files are staged. Add them to .gitignore:"
+    printf '  %s\n' "${ignore_violations[@]}"
+    echo "  fix: git rm -r --cached <path>  (after adding the pattern to .gitignore)"
+    echo
+    status=1
+fi
+
+if [ ${#lfs_violations[@]} -gt 0 ]; then
+    echo "pre-commit: these match a Git LFS rule but are staged as raw blobs:"
+    printf '  %s\n' "${lfs_violations[@]}"
+    echo "  fix: git rm --cached <path> && git add <path>   (re-runs the LFS filter)"
+    echo "  if LFS is not installed: git lfs install"
+    echo
+    status=1
+fi
+
+if [ ${#size_violations[@]} -gt 0 ]; then
+    echo "pre-commit: staged files over 5 MiB with no Git LFS rule:"
+    printf '  %s\n' "${size_violations[@]}"
+    echo "  fix: add the extension to .gitattributes, then re-stage the file."
+    echo "  (GitHub rejects any single file over 100 MiB outright.)"
+    echo
+    status=1
+fi
+
+[ "$status" -ne 0 ] && echo "Commit blocked. Override with --no-verify only if you are certain."
+exit "$status"
